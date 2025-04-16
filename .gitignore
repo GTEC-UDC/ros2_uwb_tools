@@ -1,0 +1,70 @@
+# ROS 2 build and install directories
+build/
+install/
+log/
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+.env
+venv/
+.venv/
+ENV/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# C++ specific
+*.o
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Colcon
+.colcon_cd_root
+COLCON_IGNORE
+
+# Generated message and service files
+devel/
+
+# Debug files
+callgrind.out.*
+doxygen/
+
+# Test results
+results/
+test_results/
+
+# Logs
+*.log
+core.*
+
+# Custom environment variables
+.env*
+
+# Compiled documentation
+docs/_build/ 

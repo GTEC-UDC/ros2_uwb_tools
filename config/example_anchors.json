@@ -1,0 +1,40 @@
+{
+  "anchors": [
+    {
+      "id": "0x685A",
+      "label": "Anchor1",
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 2.5
+      }
+    },
+    {
+      "id": "0x686F",
+      "label": "Anchor2",
+      "position": {
+        "x": 5.0,
+        "y": 0.0,
+        "z": 2.5
+      }
+    },
+    {
+      "id": "0x6758",
+      "label": "Anchor3",
+      "position": {
+        "x": 0.0,
+        "y": 5.0,
+        "z": 2.5
+      }
+    },
+    {
+      "id": "0x6732",
+      "label": "Anchor4",
+      "position": {
+        "x": 5.0,
+        "y": 5.0,
+        "z": 2.5
+      }
+    }
+  ]
+} 
