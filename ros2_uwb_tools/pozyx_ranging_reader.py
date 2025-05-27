@@ -81,16 +81,25 @@ class PozyxRanger(Node):
         self.declare_parameter('targetDeviceId', '0x0000')  # Remote device ID, or 0x0000 for local device
         self.declare_parameter('serial', '/dev/ttyUSB0')    # Serial port for Pozyx connection
         self.declare_parameter('debug_level', 0)  # 0 = none, 1 = normal, 2 = verbose
+        self.declare_parameter('publish_imu', True)  # Enable/disable IMU publishing
         
         # Get parameters
         targetDeviceIdString = self.get_parameter('targetDeviceId').get_parameter_value().string_value
         serial_port = self.get_parameter('serial').get_parameter_value().string_value
         self.debug_level = self.get_parameter('debug_level').get_parameter_value().integer_value
+        self.publish_imu = self.get_parameter('publish_imu').get_parameter_value().bool_value
         
         self.targetDeviceId = int(targetDeviceIdString, 16)
         
         # Create publisher for ranging data
         self.pub_ranging = self.create_publisher(Ranging, '/gtec/uwb/ranging/pozyx', 100)
+        
+        # Create publisher for IMU data if enabled
+        self.pub_imu = None
+        if self.publish_imu:
+            imu_topic = f'/gtec/uwb/imu/pozyx_{self.targetDeviceId}'
+            self.pub_imu = self.create_publisher(Imu, imu_topic, 100)
+            self.get_logger().info(f"IMU publishing enabled on topic: {imu_topic}")
         
         # Set rate for ranging measurements
         self.rate = self.create_rate(5)  # 5 Hz
@@ -132,7 +141,7 @@ class PozyxRanger(Node):
             return
             
         # Initialize ReadyToRange with the configured parameters
-        self.r = ReadyToRange(self.pozyxSerial, self.pub_ranging, self.targetDeviceId, self, self.debug_level)
+        self.r = ReadyToRange(self.pozyxSerial, self.pub_ranging, self.targetDeviceId, self, self.debug_level, self.pub_imu)
         self.hasAnchors = False
         
         # Create subscription for anchor position messages
@@ -271,7 +280,7 @@ class ReadyToRange:
     It maintains a list of anchors, performs ranging measurements, and
     publishes the results to the specified ROS 2 topic.
     """
-    def __init__(self, pozyx, ranging_pub, remote_id=None, node=None, debug_level=1):
+    def __init__(self, pozyx, ranging_pub, remote_id=None, node=None, debug_level=1, imu_pub=None):
         """
         Initialize the ReadyToRange object.
         
@@ -281,10 +290,12 @@ class ReadyToRange:
             remote_id: ID of remote device (None for local device)
             node: ROS 2 node for logging
             debug_level: Level of debug information (0=none, 1=normal, 2=verbose)
+            imu_pub: ROS 2 publisher for IMU messages (optional)
         """
         self.pozyx = pozyx
         self.remote_id = remote_id
         self.ranging_pub = ranging_pub
+        self.imu_pub = imu_pub
         self.seq = -1
         self.node = node  # Store reference to the ROS node for logging
         self.debug_level = debug_level
@@ -391,6 +402,10 @@ class ReadyToRange:
                 self.ranging_success_count = 0
                 self.last_stats_time = current_time
         
+        # Publish IMU data if enabled
+        if self.imu_pub is not None:
+            self.publishImu()
+        
         # Perform ranging with each anchor
         for anchor in self.anchors:
             range_data = DeviceRange()
@@ -402,7 +417,7 @@ class ReadyToRange:
                     if range_data.RSS < 0.0:  # Valid RSS values are negative
                         self.ranging_success_count += 1
                         self.publishRanging(anchor.network_id, range_data, current_seq)
-                        if self.node:
+                        if self.node and self.debug_level >= 2:
                             self.node.get_logger().info(f"Range to anchor {hex(anchor.network_id)}: {range_data.distance} mm, RSS: {range_data.RSS} dB")
                     else:
                         if self.node and self.debug_level >= 1:
@@ -492,6 +507,71 @@ class ReadyToRange:
             for anchor in self.anchors:
                 print(f"ANCHOR {hex(anchor.network_id)}: {str(anchor.pos)}")
                 sleep(0.025)
+
+    def publishImu(self):
+        """
+        Publish IMU data from the Pozyx device to the ROS 2 topic.
+        
+        Reads quaternion, linear acceleration, and angular velocity from the device
+        and publishes them as a sensor_msgs/Imu message.
+        """
+        try:
+            quaternion = Quaternion()
+            acceleration = Acceleration()
+            angular_velocity = AngularVelocity()
+            
+            # Get IMU data from Pozyx device
+            status_quat = self.pozyx.getQuaternion(quaternion, remote_id=self.remote_id)
+            status_accel = self.pozyx.getLinearAcceleration_mg(acceleration, remote_id=self.remote_id)
+            status_gyro = self.pozyx.getAngularVelocity_dps(angular_velocity, remote_id=self.remote_id)
+            
+            # Check if all readings were successful
+            if status_quat == POZYX_SUCCESS and status_accel == POZYX_SUCCESS and status_gyro == POZYX_SUCCESS:
+                imu = Imu()
+                imu.header.frame_id = "base_link"
+                imu.header.stamp = self.node.get_clock().now().to_msg()
+                
+                # Set orientation (quaternion)
+                imu.orientation.x = float(quaternion.x)
+                imu.orientation.y = float(quaternion.y)
+                imu.orientation.z = float(quaternion.z)
+                imu.orientation.w = float(quaternion.w)
+                
+                # Set linear acceleration (convert from mg to m/s²)
+                imu.linear_acceleration.x = float(acceleration.x) / 1000.0 * 9.80665
+                imu.linear_acceleration.y = float(acceleration.y) / 1000.0 * 9.80665
+                imu.linear_acceleration.z = float(acceleration.z) / 1000.0 * 9.80665
+                
+                # Set angular velocity (convert from degrees/s to rad/s)
+                imu.angular_velocity.x = float(angular_velocity.x) / 57.2957795130824
+                imu.angular_velocity.y = float(angular_velocity.y) / 57.2957795130824
+                imu.angular_velocity.z = float(angular_velocity.z) / 57.2957795130824
+                
+                # Initialize covariance matrices
+                for i in range(9):
+                    imu.angular_velocity_covariance[i] = 0.0
+                    imu.linear_acceleration_covariance[i] = 0.0
+                    imu.orientation_covariance[i] = 0.0
+                
+                # Set diagonal covariance values
+                for i in [0, 4, 8]:
+                    imu.angular_velocity_covariance[i] = 0.001
+                    imu.linear_acceleration_covariance[i] = 0.001
+                    imu.orientation_covariance[i] = 0.001
+                
+                # Publish the IMU message
+                self.imu_pub.publish(imu)
+                
+                if self.node and self.debug_level >= 2:
+                    self.node.get_logger().info(f"Published IMU data - Quat: [{quaternion.w:.3f}, {quaternion.x:.3f}, {quaternion.y:.3f}, {quaternion.z:.3f}]")
+                    
+            else:
+                if self.node and self.debug_level >= 1:
+                    self.node.get_logger().warn(f"Failed to read IMU data - Quat: {status_quat}, Accel: {status_accel}, Gyro: {status_gyro}")
+                    
+        except Exception as e:
+            if self.node:
+                self.node.get_logger().error(f"Error publishing IMU data: {e}")
 
 
 def main(args=None):

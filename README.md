@@ -33,10 +33,10 @@ This node requires anchor positions to be published on the `/gtec/toa/anchors` t
 
 ```bash
 # Using the launch file with default parameters
-ros2 launch ros2_uwb_tools pozyx_ranging_reader.launch.py
+ros2 launch ros2_uwb_tools pozyx_ranging.launch.py
 
 # With custom parameters
-ros2 launch ros2_uwb_tools pozyx_ranging_reader.launch.py serial:=/dev/ttyACM0 targetDeviceId:=0x6A23 debug_level:=1
+ros2 launch ros2_uwb_tools pozyx_ranging.launch.py serial:=/dev/ttyACM0 targetDeviceId:=0x6A23 debug_level:=1
 ```
 
 ### 2. Anchor Publisher
