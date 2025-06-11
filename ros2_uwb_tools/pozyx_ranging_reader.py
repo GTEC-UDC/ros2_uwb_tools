@@ -44,7 +44,7 @@ from rclpy.node import Node
 from time import sleep
 from pypozyx import (POZYX_POS_ALG_UWB_ONLY, POZYX_3D, Coordinates, POZYX_SUCCESS, PozyxConstants, version,
                      DeviceCoordinates, PozyxSerial, get_first_pozyx_serial_port, SingleRegister, DeviceList, 
-                     PozyxRegisters, DeviceRange, EulerAngles, Acceleration, Quaternion, AngularVelocity)
+                     PozyxRegisters, DeviceRange, EulerAngles, Acceleration, Quaternion, AngularVelocity, UWBSettings)
                      
 from pypozyx.tools.version_check import perform_latest_version_check
 
@@ -59,11 +59,15 @@ from geometry_msgs.msg import TransformStamped
 try:
     POZYX_WHO_AM_I = 0x0  # Identification register
     POZYX_FIRMWARE_VER = 0x1  # Firmware version
+    POZYX_HARDWARE_VER = 0x2  # Hardware version
+    POZYX_ST_RESULT = 0x11  # Self-test result
     POZYX_NETWORK_ID = PozyxRegisters.POZYX_NETWORK_ID
 except:
     # Use known values if not available in the library
     POZYX_WHO_AM_I = 0x0 
     POZYX_FIRMWARE_VER = 0x1
+    POZYX_HARDWARE_VER = 0x2
+    POZYX_ST_RESULT = 0x11
     POZYX_NETWORK_ID = 0x1A  # Network ID register
 
 class PozyxRanger(Node):
@@ -80,7 +84,7 @@ class PozyxRanger(Node):
         # Declare parameters with default values
         self.declare_parameter('targetDeviceId', '0x0000')  # Remote device ID, or 0x0000 for local device
         self.declare_parameter('serial', '/dev/ttyUSB0')    # Serial port for Pozyx connection
-        self.declare_parameter('debug_level', 0)  # 0 = none, 1 = normal, 2 = verbose
+        self.declare_parameter('debug_level', 1)  # 0 = none, 1 = normal, 2 = verbose
         self.declare_parameter('publish_imu', True)  # Enable/disable IMU publishing
         
         # Get parameters
@@ -104,6 +108,9 @@ class PozyxRanger(Node):
         # Set rate for ranging measurements
         self.rate = self.create_rate(5)  # 5 Hz
         
+        # Store initial rate for potential firmware adjustments
+        self.base_rate_hz = 5
+        
         self.get_logger().info("=========== POZYX Range reader ============")
         self.get_logger().info(f"targetDeviceId: {targetDeviceIdString}")
         self.get_logger().info(f"serial port: {serial_port}")
@@ -124,6 +131,9 @@ class PozyxRanger(Node):
             self.pozyxSerial = PozyxSerial(serial_port)
             self.get_logger().info(f"Successfully connected to Pozyx device at {serial_port}")
             
+            # Check firmware and hardware versions for compatibility
+            self.checkDeviceCompatibility()
+            
             # Basic connection verification (avoiding registers that might not exist)
             try:
                 # Try to read network ID as basic communication check
@@ -142,6 +152,11 @@ class PozyxRanger(Node):
             
         # Initialize ReadyToRange with the configured parameters
         self.r = ReadyToRange(self.pozyxSerial, self.pub_ranging, self.targetDeviceId, self, self.debug_level, self.pub_imu)
+        
+        # Pass firmware version to ReadyToRange if available
+        if hasattr(self, '_firmware_version'):
+            self.r._firmware_version = self._firmware_version
+            
         self.hasAnchors = False
         
         # Create subscription for anchor position messages
@@ -154,6 +169,164 @@ class PozyxRanger(Node):
             self.get_logger().info(f"Using remote device with ID: 0x{self.targetDeviceId:04x}")
         else:
             self.get_logger().info("Using local device (no remote)")
+
+    def checkDeviceCompatibility(self):
+        """
+        Check device firmware and hardware versions for compatibility issues.
+        
+        This method reads the device's firmware and hardware versions and provides
+        warnings about known compatibility issues.
+        """
+        try:
+            # Read WHO_AM_I register to verify device
+            who_am_i = SingleRegister()
+            if self.pozyxSerial.getRead(POZYX_WHO_AM_I, who_am_i) == POZYX_SUCCESS:
+                if who_am_i.value == 0x43:
+                    self.get_logger().info("✅ Device identified as Pozyx (WHO_AM_I: 0x43)")
+                else:
+                    self.get_logger().warn(f"⚠️  Unexpected WHO_AM_I value: 0x{who_am_i.value:02x} (expected 0x43)")
+            else:
+                self.get_logger().warn("Could not read WHO_AM_I register")
+            
+            # Read firmware version
+            firmware_ver = SingleRegister()
+            if self.pozyxSerial.getRead(POZYX_FIRMWARE_VER, firmware_ver) == POZYX_SUCCESS:
+                # Decode firmware version
+                if firmware_ver.value == 1:
+                    fw_str = "v1.0 (legacy format)"
+                else:
+                    major = (firmware_ver.value >> 4) & 0x0F
+                    minor = firmware_ver.value & 0x0F
+                    fw_str = f"v{major}.{minor}"
+                
+                self.get_logger().info(f"📋 Firmware version: {fw_str} (raw: 0x{firmware_ver.value:02x})")
+                
+                # Store firmware version for later use
+                self._firmware_version = firmware_ver.value
+                
+                # Check for known firmware compatibility issues
+                self.checkFirmwareCompatibility(firmware_ver.value)
+                
+            else:
+                self.get_logger().warn("Could not read firmware version")
+            
+            # Read hardware version
+            hardware_ver = SingleRegister()
+            if self.pozyxSerial.getRead(POZYX_HARDWARE_VER, hardware_ver) == POZYX_SUCCESS:
+                # Decode hardware version
+                hw_type = (hardware_ver.value >> 6) & 0x03
+                hw_version = (hardware_ver.value >> 4) & 0x03
+                
+                type_str = "Anchor" if hw_type == 0 else "Arduino Shield" if hw_type == 1 else f"Unknown ({hw_type})"
+                version_str = "1.2" if hw_version == 2 else "1.3" if hw_version == 3 else f"Unknown ({hw_version})"
+                
+                self.get_logger().info(f"🔧 Hardware: {type_str} v{version_str} (raw: 0x{hardware_ver.value:02x})")
+                
+                # Warn about device type compatibility
+                if hw_type == 0 and self.targetDeviceId == 0:
+                    self.get_logger().warn("⚠️  Hardware shows 'Anchor' but being used as local tag - this may cause issues")
+                
+            else:
+                self.get_logger().warn("Could not read hardware version")
+            
+            # Read self-test results
+            self.checkSelfTest()
+            
+        except Exception as e:
+            self.get_logger().error(f"Error checking device compatibility: {e}")
+
+    def checkFirmwareCompatibility(self, firmware_raw):
+        """
+        Check for known firmware compatibility issues.
+        
+        Args:
+            firmware_raw: Raw firmware version value from register
+        """
+        # Known firmware versions and their characteristics
+        known_versions = {
+            0x10: {"version": "v1.0", "issues": ["Legacy format", "Limited API support"]},
+            0x11: {"version": "v1.1", "issues": ["Some UWB settings not available"]},
+            0x12: {"version": "v1.2", "issues": ["Improved but some pypozyx incompatibilities"]},
+            0x13: {"version": "v1.3", "issues": ["Better compatibility"]},
+            0x14: {"version": "v1.4", "issues": ["Good compatibility"]},
+            0x15: {"version": "v1.5", "issues": ["Latest features"]},
+            0x20: {"version": "v2.0", "issues": ["New major version - generally stable"]},
+            0x21: {"version": "v2.1", "issues": ["Improved stability"]},
+            0x22: {"version": "v2.2", "issues": ["Latest stable"]},
+            0x23: {"version": "v2.3", "issues": ["Latest firmware - very stable"]},
+        }
+        
+        if firmware_raw in known_versions:
+            fw_info = known_versions[firmware_raw]
+            if fw_info["issues"]:
+                self.get_logger().warn(f"⚠️  Known issues with {fw_info['version']}:")
+                for issue in fw_info["issues"]:
+                    self.get_logger().warn(f"   • {issue}")
+        else:
+            self.get_logger().warn(f"⚠️  Unknown firmware version 0x{firmware_raw:02x} - compatibility uncertain")
+        
+        # Recommendations based on firmware version
+        if firmware_raw < 0x12:
+            self.get_logger().warn("🔄 RECOMMENDATION: Update firmware to v1.2 or later for better compatibility")
+            # Automatically reduce ranging rate for older firmware
+            if hasattr(self, 'base_rate_hz'):
+                new_rate = max(1, self.base_rate_hz // 2)  # Reduce rate by half, minimum 1 Hz
+                self.rate = self.create_rate(new_rate)
+                self.get_logger().info(f"🐌 Automatically reduced ranging rate to {new_rate} Hz for firmware compatibility")
+        elif firmware_raw == 0x10:
+            self.get_logger().warn("🔄 CRITICAL: v1.0 firmware has many limitations - update strongly recommended")
+            # Even slower rate for v1.0
+            if hasattr(self, 'base_rate_hz'):
+                new_rate = 1  # Very slow for v1.0
+                self.rate = self.create_rate(new_rate)
+                self.get_logger().info(f"🐌 Set very slow ranging rate ({new_rate} Hz) for v1.0 firmware compatibility")
+
+    def checkSelfTest(self):
+        """
+        Check device self-test results for hardware issues.
+        """
+        try:
+            selftest = SingleRegister()
+            if self.pozyxSerial.getRead(POZYX_ST_RESULT, selftest) == POZYX_SUCCESS:
+                # Decode self-test bits
+                acc_ok = (selftest.value & 0x01) != 0
+                magn_ok = (selftest.value & 0x02) != 0
+                gyro_ok = (selftest.value & 0x04) != 0
+                imu_ok = (selftest.value & 0x08) != 0
+                press_ok = (selftest.value & 0x10) != 0
+                uwb_ok = (selftest.value & 0x20) != 0
+                
+                self.get_logger().info(f"🧪 Self-test results (0x{selftest.value:02x}):")
+                self.get_logger().info(f"   • UWB: {'✅' if uwb_ok else '❌'} {'PASS' if uwb_ok else 'FAIL'}")
+                self.get_logger().info(f"   • Accelerometer: {'✅' if acc_ok else '❌'} {'PASS' if acc_ok else 'FAIL'}")
+                self.get_logger().info(f"   • Magnetometer: {'✅' if magn_ok else '❌'} {'PASS' if magn_ok else 'FAIL'}")
+                self.get_logger().info(f"   • Gyroscope: {'✅' if gyro_ok else '❌'} {'PASS' if gyro_ok else 'FAIL'}")
+                self.get_logger().info(f"   • IMU: {'✅' if imu_ok else '❌'} {'PASS' if imu_ok else 'FAIL'}")
+                self.get_logger().info(f"   • Pressure: {'✅' if press_ok else '❌'} {'PASS' if press_ok else 'FAIL'}")
+                
+                # Critical warnings
+                if not uwb_ok:
+                    self.get_logger().error("❌ UWB self-test FAILED - ranging will not work!")
+                    self._uwb_selftest_failed = True  # Store for later diagnostics
+                    
+                    # Automatically reduce ranging rate for unstable hardware
+                    if hasattr(self, 'base_rate_hz'):
+                        new_rate = 1  # Very slow rate for faulty hardware
+                        self.rate = self.create_rate(new_rate)
+                        self.get_logger().warn(f"🐌 Automatically reduced ranging rate to {new_rate} Hz due to UWB hardware issues")
+                        self.get_logger().warn("     This may improve stability but expect intermittent failures")
+                        
+                if not acc_ok and self.publish_imu:
+                    self.get_logger().warn("⚠️  Accelerometer self-test failed - IMU data may be unreliable")
+                if not (magn_ok or gyro_ok or imu_ok) and self.publish_imu:
+                    self.get_logger().warn("⚠️  IMU sensors failed self-test - disabling IMU publishing")
+                    self.publish_imu = False
+                    
+            else:
+                self.get_logger().warn("Could not read self-test results")
+                
+        except Exception as e:
+            self.get_logger().warn(f"Error reading self-test results: {e}")
 
     def setAnchors(self, anchors):
         """
@@ -170,86 +343,121 @@ class PozyxRanger(Node):
             try:
                 self.get_logger().info("Checking UWB settings (if available):")
                 
+                # Use the correct method to read all UWB settings at once
+                try:
+                    uwb_settings = UWBSettings()
+                    if self.pozyxSerial.getUWBSettings(uwb_settings) == POZYX_SUCCESS:
+                        # Get channel
+                        self.get_logger().info(f"UWB Channel: {uwb_settings.channel}")
+                        
+                        # Get bitrate and provide human-readable description
+                        bitrates = {0: "110 kbps", 1: "850 kbps", 2: "6.8 Mbps"}
+                        bitrate_str = bitrates.get(uwb_settings.bitrate, f"Unknown ({uwb_settings.bitrate})")
+                        self.get_logger().info(f"UWB Bitrate: {bitrate_str}")
+                        
+                        # Get PRF (Pulse Repetition Frequency) and provide human-readable description
+                        prf_str = "16 MHz" if uwb_settings.prf == 1 else "64 MHz" if uwb_settings.prf == 2 else f"Unknown ({uwb_settings.prf})"
+                        self.get_logger().info(f"UWB PRF: {prf_str}")
+                        
+                        # Get preamble length
+                        self.get_logger().info(f"UWB Preamble Length: {uwb_settings.plen}")
+                        
+                        # Get gain if available
+                        try:
+                            self.get_logger().info(f"UWB Gain: {uwb_settings.gain_db} dB")
+                        except AttributeError:
+                            # Some versions might not have gain_db attribute
+                            pass
+                            
+                    else:
+                        self.get_logger().warn("Could not retrieve UWB settings")
+                except Exception as e:
+                    self.get_logger().warn(f"Error getting UWB settings: {e}")
+                    
+                # Try to get individual channel setting as fallback if getUWBSettings fails
                 try:
                     uwb_channel = SingleRegister()
                     if self.pozyxSerial.getUWBChannel(uwb_channel) == POZYX_SUCCESS:
-                        self.get_logger().info(f"UWB Channel: {uwb_channel.value}")
+                        self.get_logger().info(f"UWB Channel (fallback): {uwb_channel.value}")
                     else:
                         self.get_logger().warn("Could not retrieve UWB channel")
                 except Exception as e:
                     self.get_logger().warn(f"Error getting UWB channel: {e}")
                     
-                try:
-                    uwb_bitrate = SingleRegister()
-                    if self.pozyxSerial.getUWBBitrate(uwb_bitrate) == POZYX_SUCCESS:
-                        bitrates = {0: "110 kbps", 1: "850 kbps", 2: "6.8 Mbps"}
-                        bitrate_str = bitrates.get(uwb_bitrate.value, f"Unknown ({uwb_bitrate.value})")
-                        self.get_logger().info(f"UWB Bitrate: {bitrate_str}")
-                except Exception as e:
-                    self.get_logger().warn(f"Error getting UWB bitrate: {e}")
-                
-                try:
-                    uwb_prf = SingleRegister()
-                    if self.pozyxSerial.getUWBPRF(uwb_prf) == POZYX_SUCCESS:
-                        prf_str = "16 MHz" if uwb_prf.value == 1 else "64 MHz" if uwb_prf.value == 2 else f"Unknown ({uwb_prf.value})"
-                        self.get_logger().info(f"UWB PRF: {prf_str}")
-                except Exception as e:
-                    self.get_logger().warn(f"Error getting UWB PRF: {e}")
-                    
             except Exception as e:
                 self.get_logger().warn(f"Error checking UWB settings: {e}")
         
-        # Start ranging thread to avoid blocking the main node execution
-        try:
-            from threading import Thread
+        # Start continuous ranging loop directly (no background thread)
+        self.get_logger().info("Starting continuous ranging measurements...")
+        
+        # Check if remote device is reachable before starting ranging
+        if self.targetDeviceId != 0:
+            self.get_logger().info(f"Checking communication with remote device 0x{self.targetDeviceId:04x}...")
+            try:
+                # Try to read network ID from remote device
+                remote_network_id = SingleRegister()
+                status = self.pozyxSerial.getRead(POZYX_NETWORK_ID, remote_network_id, self.targetDeviceId)
+                if status == POZYX_SUCCESS:
+                    self.get_logger().info(f"✅ Remote device 0x{self.targetDeviceId:04x} is reachable (Network ID: 0x{remote_network_id.value:04x})")
+                else:
+                    self.get_logger().error(f"❌ Cannot communicate with remote device 0x{self.targetDeviceId:04x}")
+                    self.get_logger().error("   This could be due to:")
+                    self.get_logger().error("   • UWB hardware failure on USB device (self-test failed)")
+                    self.get_logger().error("   • Remote device is not powered on")
+                    self.get_logger().error("   • Remote device is out of range")
+                    self.get_logger().error("   • Network ID mismatch")
+                    self.get_logger().error("   • UWB channel/settings mismatch")
+                    return
+            except Exception as e:
+                self.get_logger().error(f"❌ Exception checking remote device: {e}")
+                return
+        
+        last_error_time = 0.0
+        error_count = 0
+        import time
+        
+        self.get_logger().info("🔄 Entering main ranging loop...")
+        loop_iteration = 0
+        
+        while rclpy.ok():
+            loop_iteration += 1
+            self.get_logger().info(f"📍 Loop iteration {loop_iteration} - About to call r.loop()...")
             
-            # Define a separate function for the ranging loop
-            def ranging_loop():
-                last_error_time = 0.0
-                error_count = 0
-                import time
+            try:
+                self.r.loop()
+                self.get_logger().info(f"✅ Loop iteration {loop_iteration} completed successfully")
                 
-                while rclpy.ok():
-                    try:
-                        self.r.loop()
-                        self.rate.sleep()
-                        # Reset error counter if no problems occurred
-                        error_count = 0
-                    except Exception as e:
-                        current_time = time.time()
-                        error_count += 1
-                        
-                        # Limit error logging to avoid filling up the logs
-                        if current_time - last_error_time > 5.0 or error_count <= 3:
-                            self.get_logger().error(f"Error in ranging loop: {e}")
-                            last_error_time = current_time
-                        
-                        # Try to recover from the error
-                        try:
-                            time.sleep(1.0)  # Short pause to avoid system overload
-                        except:
-                            pass
-            
-            # Start ranging thread as daemon (will terminate when main program ends)
-            ranging_thread = Thread(target=ranging_loop, daemon=True)
-            ranging_thread.start()
-            self.get_logger().info("Ranging measurements started in background thread")
-            
-        except Exception as e:
-            self.get_logger().error(f"Failed to start ranging thread: {e}")
-            # Fallback: use original blocking loop if thread creation fails
-            self.get_logger().info("Falling back to blocking ranging loop")
-            while rclpy.ok():
+                # Calculate sleep time in seconds
+                sleep_time_seconds = 1.0 / self.base_rate_hz
+                self.get_logger().info(f"💤 Sleeping for {sleep_time_seconds*1000:.0f}ms before next iteration...")
+                
+                # Use time.sleep instead of rate.sleep to avoid ROS2 timer issues
+                time.sleep(sleep_time_seconds)
+                
+                self.get_logger().info(f"⏰ Sleep completed, checking rclpy.ok()...")
+                
+                if not rclpy.ok():
+                    self.get_logger().info("🛑 rclpy.ok() returned False, exiting loop")
+                    break
+                else:
+                    self.get_logger().info(f"✅ rclpy.ok() is True, continuing to iteration {loop_iteration + 1}")
+                
+                # Reset error counter if no problems occurred
+                error_count = 0
+            except Exception as e:
+                current_time = time.time()
+                error_count += 1
+                
+                # Limit error logging to avoid filling up the logs
+                if current_time - last_error_time > 5.0 or error_count <= 3:
+                    self.get_logger().error(f"❌ Error in ranging loop iteration {loop_iteration}: {e}")
+                    last_error_time = current_time
+                
+                # Try to recover from the error
                 try:
-                    self.r.loop()
-                    self.rate.sleep()
-                except Exception as e:
-                    self.get_logger().error(f"Error in ranging loop: {e}")
-                    try:
-                        import time
-                        time.sleep(1.0)  # Short pause to avoid system overload
-                    except:
-                        pass
+                    time.sleep(1.0)  # Short pause to avoid system overload
+                except:
+                    pass
 
     def callbackAnchorsMessage(self, anchorsMsg):
         """
@@ -321,6 +529,10 @@ class ReadyToRange:
         self.anchors = anchors
         self.printPublishAnchorConfiguration()
         
+        # Perform anchor connectivity check
+        if self.node and self.debug_level >= 1:
+            self.checkAnchorConnectivity()
+        
         # Store device list on the Pozyx for ranging
         if self.node and self.debug_level >= 1:
             self.node.get_logger().info("Setting device list on Pozyx...")
@@ -383,10 +595,16 @@ class ReadyToRange:
         This method is called repeatedly to perform ranging measurements
         and publish the results. It handles sequence numbers and statistics.
         """
+        if self.node and self.debug_level >= 1:
+            self.node.get_logger().info("🔍 ReadyToRange.loop() called - starting ranging cycle")
+        
         self.seq += 1
         if self.seq > 255:
             self.seq = 0
         current_seq = self.seq
+        
+        if self.node and self.debug_level >= 2:
+            self.node.get_logger().info(f"Starting ranging cycle {current_seq} with {len(self.anchors)} anchors")
         
         # Log statistics every 10 seconds
         if self.node and self.debug_level >= 1:
@@ -407,49 +625,104 @@ class ReadyToRange:
             self.publishImu()
         
         # Perform ranging with each anchor
-        for anchor in self.anchors:
+        for i, anchor in enumerate(self.anchors):
+            if self.node and self.debug_level >= 2:
+                self.node.get_logger().info(f"Attempting ranging with anchor {i+1}/{len(self.anchors)}: 0x{anchor.network_id:04x}")
+            
             range_data = DeviceRange()
             try:
                 self.ranging_count += 1
-                status = self.pozyx.doRanging(anchor.network_id, range_data, self.remote_id)
+                
+                # Add firmware-specific delays and configurations
+                if hasattr(self, '_firmware_version') and self._firmware_version <= 0x11:
+                    # Older firmware needs more time between operations
+                    import time
+                    time.sleep(0.05)  # 50ms delay for older firmware
+                
+                if self.node and self.debug_level >= 2:
+                    self.node.get_logger().info(f"Calling doRanging(0x{anchor.network_id:04x}, range_data, 0x{self.remote_id:04x if self.remote_id else 0:04x})")
+                
+                # Add timeout protection for doRanging to prevent indefinite blocking
+                import signal
+                import time
+                
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("doRanging call timed out")
+                
+                try:
+                    # Set a 5-second timeout for ranging operation
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(5)  # 5 second timeout
+                    
+                    start_time = time.time()
+                    status = self.pozyx.doRanging(anchor.network_id, range_data, self.remote_id)
+                    end_time = time.time()
+                    
+                    # Clear the timeout
+                    signal.alarm(0)
+                    
+                    if self.node and self.debug_level >= 2:
+                        self.node.get_logger().info(f"doRanging completed in {(end_time - start_time)*1000:.1f}ms, status: {status}")
+                        
+                except TimeoutError:
+                    signal.alarm(0)  # Clear timeout
+                    if self.node:
+                        self.node.get_logger().error(f"⏰ doRanging with anchor 0x{anchor.network_id:04x} timed out after 5 seconds!")
+                        self.node.get_logger().error("   This suggests the UWB hardware is not responding properly")
+                    continue  # Skip to next anchor
+                except Exception as ranging_exception:
+                    signal.alarm(0)  # Clear timeout
+                    raise ranging_exception  # Re-raise the original exception
+                
+                if self.node and self.debug_level >= 2:
+                    self.node.get_logger().info(f"doRanging returned status: {status}")
                 
                 if status == POZYX_SUCCESS:
                     if range_data.RSS < 0.0:  # Valid RSS values are negative
                         self.ranging_success_count += 1
                         self.publishRanging(anchor.network_id, range_data, current_seq)
-                        if self.node and self.debug_level >= 2:
-                            self.node.get_logger().info(f"Range to anchor {hex(anchor.network_id)}: {range_data.distance} mm, RSS: {range_data.RSS} dB")
+                        if self.node and self.debug_level >= 1:
+                            self.node.get_logger().info(f"✅ Range to anchor 0x{anchor.network_id:04x}: {range_data.distance} mm, RSS: {range_data.RSS} dB")
                     else:
                         if self.node and self.debug_level >= 1:
-                            self.node.get_logger().warn(f"Invalid RSS value for anchor {hex(anchor.network_id)}: {range_data.RSS} dB")
+                            self.node.get_logger().warn(f"❌ Invalid RSS value for anchor 0x{anchor.network_id:04x}: {range_data.RSS} dB")
                 else:
-                    if self.node and self.debug_level >= 1:
+                    if self.node:
                         try:
                             error_code = SingleRegister()
                             self.pozyx.getErrorCode(error_code)
-                            self.node.get_logger().warn(f"Ranging failed for anchor {hex(anchor.network_id)}, error code: 0x{error_code.value:02x}")
                             
-                            # Common error codes
-                            if error_code.value == 0x01:
-                                self.node.get_logger().warn("Error: POZYX_FAILURE - General failure")
-                            elif error_code.value == 0x02:
-                                self.node.get_logger().warn("Error: POZYX_TIMEOUT - Function timeout")
-                            elif error_code.value == 0x03:
-                                self.node.get_logger().warn("Error: POZYX_INVALID - Invalid function parameters")
-                            elif error_code.value == 0x04:
-                                self.node.get_logger().warn("Error: POZYX_ANCHOR_NOT_FOUND - Anchor not found")
-                            elif error_code.value == 0x05:
-                                self.node.get_logger().warn("Error: POZYX_UWB_BUSY - UWB busy")
-                            elif error_code.value == 0x06:
-                                self.node.get_logger().warn("Error: POZYX_FUNCTION_NOT_AVAILABLE - Function not available")
-                            elif error_code.value == 0x08:
-                                self.node.get_logger().warn("Error: POZYX_NO_FLASH - No flash memory")
+                            # Error code mapping for concise logging
+                            error_names = {
+                                0x01: "POZYX_FAILURE",
+                                0x02: "POZYX_TIMEOUT", 
+                                0x03: "POZYX_INVALID",
+                                0x04: "POZYX_ANCHOR_NOT_FOUND",
+                                0x05: "POZYX_UWB_BUSY",
+                                0x06: "POZYX_FUNCTION_NOT_AVAILABLE",
+                                0x08: "POZYX_NO_FLASH",
+                                0x0A: "POZYX_NOT_ENOUGH_ANCHORS",
+                                0x0B: "POZYX_DISCOVERY",
+                                0x0E: "POZYX_ANCHOR_NOT_FOUND",
+                                0x11: "POZYX_RANGING",
+                                0x12: "POZYX_RTIMEOUT1",
+                                0x13: "POZYX_RTIMEOUT2", 
+                                0x14: "POZYX_TXLATE",
+                                0x15: "POZYX_UWB_BUSY",
+                                0x16: "POZYX_POSALG",
+                                0x17: "POZYX_NOACK",
+                                0xFF: "POZYX_GENERAL"
+                            }
+                            
+                            error_name = error_names.get(error_code.value, f"UNKNOWN_0x{error_code.value:02x}")
+                            self.node.get_logger().warn(f"❌ Anchor 0x{anchor.network_id:04x} failed: {error_name} (0x{error_code.value:02x})")
+                            
                         except Exception as e:
-                            self.node.get_logger().warn(f"Could not get error code: {e}")
+                            self.node.get_logger().warn(f"❌ Anchor 0x{anchor.network_id:04x}: Could not get error code - {e}")
                         
             except Exception as e:
                 if self.node:
-                    self.node.get_logger().error(f"Exception in ranging: {e}")
+                    self.node.get_logger().error(f"❌ Exception in ranging with anchor 0x{anchor.network_id:04x}: {e}")
                 else:
                     print("################## An exception occurred #########################")
                     print(f"Error: {e}")
@@ -463,9 +736,14 @@ class ReadyToRange:
                             print("No Pozyx connected. Check your USB cable or your driver!")
                         quit()
                     self.pozyx = PozyxSerial(serial_port)
+                    if self.node:
+                        self.node.get_logger().info("Reconnected to Pozyx device")
                 except Exception as reconnect_error:
                     if self.node:
                         self.node.get_logger().error(f"Error reconnecting to Pozyx: {reconnect_error}")
+        
+        if self.node and self.debug_level >= 2:
+            self.node.get_logger().info(f"Completed ranging cycle {current_seq}")
 
     def publishRanging(self, anchorId, range, seq):
         """
@@ -567,11 +845,121 @@ class ReadyToRange:
                     
             else:
                 if self.node and self.debug_level >= 1:
-                    self.node.get_logger().warn(f"Failed to read IMU data - Quat: {status_quat}, Accel: {status_accel}, Gyro: {status_gyro}")
+                    error_msgs = []
+                    if status_quat != POZYX_SUCCESS:
+                        error_msgs.append(f"Quaternion: {status_quat}")
+                    if status_accel != POZYX_SUCCESS:
+                        error_msgs.append(f"Acceleration: {status_accel}")
+                    if status_gyro != POZYX_SUCCESS:
+                        error_msgs.append(f"Gyro: {status_gyro}")
+                    
+                    self.node.get_logger().warn(f"Failed to read IMU data - {', '.join(error_msgs)}")
+                    
+                    # Check if this might be a device compatibility issue
+                    if all(status == 0 for status in [status_quat, status_accel, status_gyro]):
+                        self.node.get_logger().warn("  → All IMU functions returned 0 - device might not support IMU or wrong device type (anchor vs tag)")
+                        # Disable IMU publishing if it's consistently failing
+                        if hasattr(self, '_imu_failure_count'):
+                            self._imu_failure_count += 1
+                            if self._imu_failure_count > 10:
+                                self.node.get_logger().warn("  → Disabling IMU publishing due to repeated failures")
+                                self.imu_pub = None
+                        else:
+                            self._imu_failure_count = 1
                     
         except Exception as e:
             if self.node:
                 self.node.get_logger().error(f"Error publishing IMU data: {e}")
+                if self.debug_level >= 1:
+                    self.node.get_logger().error("  → This might indicate the device doesn't support IMU functionality")
+
+    def checkAnchorConnectivity(self):
+        """
+        Perform a basic connectivity check with configured anchors.
+        
+        This method attempts to perform ranging with each anchor to verify
+        that they are reachable and responding properly.
+        """
+        if not self.node:
+            return
+            
+        if self.remote_id and self.remote_id != 0:
+            self.node.get_logger().info(f"Performing anchor connectivity check...")
+            # Get USB device network ID safely
+            try:
+                usb_network_id = SingleRegister()
+                if self.pozyx.getRead(POZYX_NETWORK_ID, usb_network_id) == POZYX_SUCCESS:
+                    self.node.get_logger().info(f"📡 Testing communication: USB anchor (0x{usb_network_id.value:04x}) → Remote tag (0x{self.remote_id:04x}) → Target anchors")
+                else:
+                    self.node.get_logger().info(f"📡 Testing communication: USB anchor → Remote tag (0x{self.remote_id:04x}) → Target anchors")
+            except:
+                self.node.get_logger().info(f"📡 Testing communication: USB anchor → Remote tag (0x{self.remote_id:04x}) → Target anchors")
+        else:
+            self.node.get_logger().info(f"Performing anchor connectivity check...")
+            self.node.get_logger().info(f"📡 Testing direct ranging from local device to anchors")
+        
+        reachable_anchors = 0
+        total_anchors = len(self.anchors)
+        
+        for anchor in self.anchors:
+            try:
+                range_data = DeviceRange()
+                status = self.pozyx.doRanging(anchor.network_id, range_data, self.remote_id)
+                
+                if status == POZYX_SUCCESS:
+                    if range_data.RSS < 0.0:  # Valid RSS values are negative
+                        reachable_anchors += 1
+                        if self.remote_id and self.remote_id != 0:
+                            self.node.get_logger().info(f"✓ Anchor 0x{anchor.network_id:04x}: Range={range_data.distance}mm, RSS={range_data.RSS}dB (via remote tag 0x{self.remote_id:04x})")
+                        else:
+                            self.node.get_logger().info(f"✓ Anchor 0x{anchor.network_id:04x}: Range={range_data.distance}mm, RSS={range_data.RSS}dB (direct)")
+                    else:
+                        self.node.get_logger().warn(f"✗ Anchor 0x{anchor.network_id:04x}: Invalid RSS value ({range_data.RSS}dB)")
+                else:
+                    error_code = SingleRegister()
+                    self.pozyx.getErrorCode(error_code)
+                    self.node.get_logger().warn(f"✗ Anchor 0x{anchor.network_id:04x}: Error 0x{error_code.value:02x}")
+                    
+            except Exception as e:
+                self.node.get_logger().warn(f"✗ Anchor 0x{anchor.network_id:04x}: Exception - {e}")
+        
+        # Provide diagnostic summary with hardware-specific advice
+        if reachable_anchors == 0:
+            self.node.get_logger().error("⚠️  NO ANCHORS REACHABLE!")
+            self.node.get_logger().error("Troubleshooting suggestions:")
+            self.node.get_logger().error("  1. Check that anchors are powered on")
+            self.node.get_logger().error("  2. Verify anchor positions are published correctly")
+            self.node.get_logger().error("  3. Check UWB channel settings match between tag and anchors")
+            self.node.get_logger().error("  4. Ensure tag and anchors are on the same network")
+            self.node.get_logger().error("  5. Check that tag is within ranging distance of anchors")
+            self.node.get_logger().error("  6. FIRMWARE COMPATIBILITY:")
+            self.node.get_logger().error("     • Verify tag and anchors have compatible firmware versions")
+            self.node.get_logger().error("     • Update all devices to same firmware version if possible")
+            self.node.get_logger().error("     • Check if anchors are using legacy firmware (v1.0)")
+            self.node.get_logger().error("  7. Try reducing ranging frequency (increase sleep time)")
+            
+            # Add specific advice for failed UWB self-test
+            if hasattr(self.node, '_uwb_selftest_failed') and self.node._uwb_selftest_failed:
+                self.node.get_logger().error("  8. HARDWARE ISSUE DETECTED:")
+                self.node.get_logger().error("     • USB anchor UWB self-test failed - hardware may be faulty")
+                self.node.get_logger().error("     • Try using a different Pozyx device as USB bridge")
+                self.node.get_logger().error("     • Contact Pozyx support for hardware replacement")
+                
+        elif reachable_anchors < total_anchors:
+            self.node.get_logger().warn(f"⚠️  Only {reachable_anchors}/{total_anchors} anchors reachable")
+            self.node.get_logger().warn("Some anchors may be out of range, powered off, or have communication issues")
+            self.node.get_logger().warn("Consider checking firmware compatibility for unreachable anchors")
+        else:
+            self.node.get_logger().info(f"✅ All {reachable_anchors}/{total_anchors} anchors reachable")
+            
+            # Add warning if UWB self-test failed but connectivity works
+            if hasattr(self.node, '_uwb_selftest_failed') and self.node._uwb_selftest_failed:
+                self.node.get_logger().warn("⚠️  WARNING: UWB self-test failed but connectivity check passed")
+                self.node.get_logger().warn("     This suggests the USB anchor UWB is partially working but may be unreliable")
+                self.node.get_logger().warn("     Expect intermittent failures during continuous operation")
+                self.node.get_logger().warn("     Consider replacing the USB anchor for stable operation")
+            
+        self.node.get_logger().info("Connectivity check complete")
 
 
 def main(args=None):

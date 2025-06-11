@@ -1,39 +1,48 @@
 {
   "anchors": [
     {
-      "id": "0x685A",
-      "label": "Anchor1",
+      "id": "0x685B",
+      "label": "Sur",
       "position": {
-        "x": 0.0,
-        "y": 0.0,
-        "z": 2.5
+        "x": -0.390,
+        "y": 3.306,
+        "z": 2.32
+      }
+    },
+    {
+      "id": "0x687C",
+      "label": "Oeste",
+      "position": {
+        "x": 0.409,
+        "y": 5.630,
+        "z": 2.32
       }
     },
     {
       "id": "0x686F",
-      "label": "Anchor2",
+      "label": "Norte",
       "position": {
-        "x": 5.0,
-        "y": 0.0,
-        "z": 2.5
+        "x": 5.552,
+        "y": 2.033,
+        "z": 2.32
       }
     },
     {
-      "id": "0x6758",
-      "label": "Anchor3",
+      "id": "0x6867",
+      "label": "EsteNorte",
       "position": {
-        "x": 0.0,
-        "y": 5.0,
-        "z": 2.5
+        "x": 3.082,
+        "y": -0.713,
+        "z": 0.377
       }
     },
     {
-      "id": "0x6732",
-      "label": "Anchor4",
+      "id": "0x685A",
+      "label": "EsteSur",
       "position": {
-        "x": 5.0,
-        "y": 5.0,
-        "z": 2.5
+        "x": 1.209,
+        "y": -0.729,
+        "z": 1.662
       }
     }
   ]
